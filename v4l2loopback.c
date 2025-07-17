@@ -611,6 +611,28 @@ struct v4l2l_format {
 #define V4L2L_TOKEN_MASK \
 	(V4L2L_TOKEN_CAPTURE | V4L2L_TOKEN_OUTPUT | V4L2L_TOKEN_TIMEOUT)
 
+/*Thread-safe macros for token verification
+  Copyright (C) 2025 Eli Oliveira Junior */
+#define has_output_token_safe(dev)                                 \
+	({                                                         \
+		unsigned long __flags;                             \
+		bool __result;                                     \
+		spin_lock_irqsave(&(dev)->lock, __flags);          \
+		__result = has_output_token((dev)->stream_tokens); \
+		spin_unlock_irqrestore(&(dev)->lock, __flags);     \
+		__result;                                          \
+	})
+
+#define has_capture_token_safe(dev)                                 \
+	({                                                          \
+		unsigned long __flags;                              \
+		bool __result;                                      \
+		spin_lock_irqsave(&(dev)->lock, __flags);           \
+		__result = has_capture_token((dev)->stream_tokens); \
+		spin_unlock_irqrestore(&(dev)->lock, __flags);      \
+		__result;                                           \
+	})
+
 /* helpers for token exchange and token status */
 #define token_from_type(type) \
 	(V4L2_TYPE_IS_CAPTURE(type) ? V4L2L_TOKEN_CAPTURE : V4L2L_TOKEN_OUTPUT)
@@ -2984,6 +3006,16 @@ static int vidioc_streamoff(struct file *file, void *fh,
 		/* reset output queue */
 		if (dev->used_buffer_count > 0)
 			prepare_buffer_queue(dev, dev->used_buffer_count);
+
+		// Cleanup dynamic buffer if there are no more outputs
+		if (dev->use_dynamic_buffering &&
+		    !has_output_token(dev->stream_tokens)) {
+			mutex_lock(&dev->image_mutex);
+			if (dev->dbuf && atomic_read(&dev->open_count) == 0) {
+				free_dynamic_buffer(dev);
+			}
+			mutex_unlock(&dev->image_mutex);
+		}
 		return 0;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
 		if (opener->stream_token & token) {
@@ -3276,10 +3308,20 @@ static int v4l2_loopback_close(struct file *file)
 		mutex_unlock(&dev->image_mutex);
 	}
 
+	bool should_cleanup = false;
+	unsigned long flags;
+
 	if (atomic_dec_and_test(&dev->open_count)) {
 		timer_delete_sync(&dev->sustain_timer);
 		timer_delete_sync(&dev->timeout_timer);
-		if (!dev->keep_format) {
+
+		// Check for active streams
+		spin_lock_irqsave(&dev->lock, flags);
+		should_cleanup = !has_output_token(dev->stream_tokens) &&
+				 !has_capture_token(dev->stream_tokens);
+		spin_unlock_irqrestore(&dev->lock, flags);
+
+		if (should_cleanup && !dev->keep_format) {
 			mutex_lock(&dev->image_mutex);
 			free_buffers(dev);
 			mutex_unlock(&dev->image_mutex);
@@ -3418,6 +3460,11 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
 
 		if (count == 0)
 			return 0;
+
+		if (!dev->dbuf || !dev->dbuf->active) {
+			dprintk("write(): dynamic buffer not available\n");
+			return -ENODEV;
+		}
 
 		/* Ensure we have format configured */
 		if (dev->pix_format.sizeimage == 0) {
@@ -4003,6 +4050,14 @@ static void free_dynamic_buffer(struct v4l2_loopback_device *dev)
 
 	/* Thread-safe removal of device reference */
 	spin_lock_irqsave(&dev->lock, flags);
+
+	if (has_output_token(dev->stream_tokens)) {
+		// There are active producers - postpone cleanup
+		spin_unlock_irqrestore(&dev->lock, flags);
+		dprintk("free_dynamic_buffer: deferring cleanup - active producers\n");
+		return;
+	}
+
 	dbuf = dev->dbuf;
 	dev->dbuf = NULL;
 	spin_unlock_irqrestore(&dev->lock, flags);
@@ -4253,12 +4308,17 @@ static int dynamic_buffer_write(struct v4l2_loopback_device *dev, const u8 *src,
 	/* Safely getting the buffer reference */
 	spin_lock_irqsave(&dev->lock, flags);
 	dbuf = dev->dbuf;
-	if (dbuf)
+	if (dbuf && dbuf->active && !dbuf->shutdown_requested) {
 		atomic_inc(&dbuf->ref_count);
+	} else {
+		dbuf = NULL;
+	}
 	spin_unlock_irqrestore(&dev->lock, flags);
 
-	if (unlikely(!dbuf))
+	if (unlikely(!dbuf)) {
+		dprintk("dynamic_buffer_write: buffer unavailable or shutting down\n");
 		return -ENODEV;
+	}
 
 retry_write:
 	spin_lock_irqsave(&dbuf->lock, flags);
@@ -4408,12 +4468,17 @@ static int dynamic_buffer_read(struct v4l2_loopback_device *dev, u8 *dst,
 	/* Safely getting the buffer reference */
 	spin_lock_irqsave(&dev->lock, flags);
 	dbuf = dev->dbuf;
-	if (dbuf)
+	if (dbuf && dbuf->active && !dbuf->shutdown_requested) {
 		atomic_inc(&dbuf->ref_count);
+	} else {
+		dbuf = NULL;
+	}
 	spin_unlock_irqrestore(&dev->lock, flags);
 
-	if (unlikely(!dbuf))
+	if (unlikely(!dbuf)) {
+		dprintk("dynamic_buffer_read: buffer unavailable or shutting down\n");
 		return -ENODEV;
+	}
 
 	/* Blocking mode: wait for data or shutdown */
 	if (block) {
